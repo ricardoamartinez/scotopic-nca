@@ -8,93 +8,224 @@ import time
 import threading
 from queue import Queue
 
-class SimpleStableNCA(nn.Module):
+class AdaptiveScotopicNCA(nn.Module):
     """
-    Much simpler, more stable NCA for RGB reconstruction
-    No living/dead mechanism, just basic RGB + communication channels
+    Enhanced NCA with error prediction, attention, and multi-scale processing
     """
     def __init__(self):
         super().__init__()
         
-        # Simple architecture: RGB (3) + communication (3) = 6 channels total
-        self.n_channels = 6  # Much simpler than Growing NCA
+        # Enhanced architecture: RGB (3) + Error Prediction (1) + Attention (1) + Communication (6) = 11 channels
+        self.rgb_channels = 3
+        self.error_channel = 1      # Predicts reconstruction error
+        self.attention_channel = 1  # Attention weights
+        self.comm_channels = 6      # Communication/memory
+        self.n_channels = self.rgb_channels + self.error_channel + self.attention_channel + self.comm_channels
         
-        # Sobel filters for perception
+        # Multi-scale Sobel filters for better perception
         sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=torch.float32) / 8.0
         sobel_y = sobel_x.T
         
+        # Large scale gradients for global structure
+        sobel_x_large = torch.tensor([
+            [-1, -2, 0, 2, 1],
+            [-2, -4, 0, 4, 2], 
+            [-1, -2, 0, 2, 1]
+        ], dtype=torch.float32) / 16.0
+        sobel_y_large = torch.tensor([
+            [-1, -2, -1],
+            [-2, -4, -2],
+            [0, 0, 0],
+            [2, 4, 2],
+            [1, 2, 1]
+        ], dtype=torch.float32) / 16.0
+        
         self.register_buffer('sobel_x', sobel_x.view(1, 1, 3, 3))
         self.register_buffer('sobel_y', sobel_y.view(1, 1, 3, 3))
+        self.register_buffer('sobel_x_large', sobel_x_large.view(1, 1, 3, 5))
+        self.register_buffer('sobel_y_large', sobel_y_large.view(1, 1, 5, 3))
         
-        # Very simple update network
-        perception_size = self.n_channels * 3  # 18 channels: state + grad_x + grad_y
+        # Multi-scale perception network
+        perception_size = self.n_channels * 5  # state + grad_x + grad_y + grad_x_large + grad_y_large
         
+        # Main update network with attention
         self.update_net = nn.Sequential(
-            nn.Conv2d(perception_size, 32, 1),  # Much smaller network
+            nn.Conv2d(perception_size, 64, 1),
+            nn.ReLU(),
+            nn.Conv2d(64, 32, 1),
             nn.ReLU(),
             nn.Conv2d(32, self.n_channels, 1, bias=False)
         )
         
-        # Initialize with very small weights to prevent explosion
+        # Error prediction network - predicts where errors will be high
+        self.error_predictor = nn.Sequential(
+            nn.Conv2d(perception_size, 32, 1),
+            nn.ReLU(),
+            nn.Conv2d(32, 16, 1),
+            nn.ReLU(), 
+            nn.Conv2d(16, 1, 1),
+            nn.Sigmoid()  # Error prediction in [0,1]
+        )
+        
+        # Attention network - learns where to focus processing
+        self.attention_net = nn.Sequential(
+            nn.Conv2d(perception_size, 32, 1),
+            nn.ReLU(),
+            nn.Conv2d(32, 16, 1), 
+            nn.ReLU(),
+            nn.Conv2d(16, 1, 1),
+            nn.Sigmoid()  # Attention weights in [0,1]
+        )
+        
+        # Initialize with very small weights but allow error and attention networks to be more expressive
         with torch.no_grad():
-            for param in self.parameters():
-                param.normal_(0, 0.001)  # Very small initialization
+            for param in self.update_net.parameters():
+                param.normal_(0, 0.001)
+            for param in self.error_predictor.parameters():
+                param.normal_(0, 0.01)  # Slightly larger for error prediction
+            for param in self.attention_net.parameters():
+                param.normal_(0, 0.01)  # Slightly larger for attention
     
     def perceive(self, state):
-        """Simple perception using Sobel filters"""
+        """Multi-scale perception using multiple Sobel filters"""
         batch_size, channels, height, width = state.shape
         
         grad_x_list = []
         grad_y_list = []
+        grad_x_large_list = []
+        grad_y_large_list = []
         
         for c in range(channels):
             channel = state[:, c:c+1, :, :]
             
+            # Fine scale gradients
             gx = F.conv2d(channel, self.sobel_x, padding=1)
             gy = F.conv2d(channel, self.sobel_y, padding=1)
             
+            # Large scale gradients (with padding to maintain size)
+            gx_large = F.conv2d(channel, self.sobel_x_large, padding=(1, 2))  # 3x5 filter
+            gy_large = F.conv2d(channel, self.sobel_y_large, padding=(2, 1))  # 5x3 filter
+            
             grad_x_list.append(gx)
             grad_y_list.append(gy)
+            grad_x_large_list.append(gx_large)
+            grad_y_large_list.append(gy_large)
         
         grad_x = torch.cat(grad_x_list, dim=1)
         grad_y = torch.cat(grad_y_list, dim=1)
+        grad_x_large = torch.cat(grad_x_large_list, dim=1)
+        grad_y_large = torch.cat(grad_y_large_list, dim=1)
         
-        perception = torch.cat([state, grad_x, grad_y], dim=1)
+        # Multi-scale perception
+        perception = torch.cat([state, grad_x, grad_y, grad_x_large, grad_y_large], dim=1)
         return perception
     
-    def forward(self, state, sparse_input, sparse_mask, steps=1):
-        """Simple forward pass without stochastic updates or living masks"""
+    def forward(self, state, sparse_input, sparse_mask, target_frame=None, steps=1):
+        """Enhanced forward pass with error prediction and attention"""
+        predicted_errors = []
+        attention_maps = []
+        
         for step in range(steps):
-            # Direct sparse injection (avoid in-place operations)
+            # Inject sparse input into RGB channels
             rgb_channels = torch.where(
                 sparse_mask.bool(),
                 sparse_input,
-                state[:, 0:3, :, :]
+                state[:, :self.rgb_channels, :, :]
             )
             
-            # Reconstruct state without in-place operations
-            state = torch.cat([rgb_channels, state[:, 3:6, :, :]], dim=1)
+            # Update error prediction based on sparse input confidence
+            input_confidence = sparse_mask.float().mean(dim=1, keepdim=True)  # How much info we have
+            uncertainty = 1.0 - input_confidence  # Higher uncertainty with less info
             
-            # Perception
+            # Update state with current uncertainty estimate
+            state = torch.cat([
+                rgb_channels,
+                uncertainty,  # Error channel based on input sparsity
+                state[:, self.rgb_channels + self.error_channel:, :, :]
+            ], dim=1)
+            
+            # Multi-scale perception
             perception = self.perceive(state)
             
-            # Update rule
+            # Predict future error
+            predicted_error = self.error_predictor(perception)
+            predicted_errors.append(predicted_error)
+            
+            # Generate attention map
+            attention = self.attention_net(perception)
+            attention_maps.append(attention)
+            
+            # Main update with attention weighting
             ds = self.update_net(perception)
             
-            # Simple update with small step size for stability
-            state = state + ds * 0.1  # Very small step size
+            # Apply attention to focus updates on important regions
+            attention_expanded = attention.expand_as(ds)
+            ds = ds * (0.5 + attention_expanded)  # Attention modulates update strength
             
-            # Clamp RGB channels to [0,1] and communication channels to [-1,1] (non-inplace)
-            rgb_clamped = torch.clamp(state[:, 0:3, :, :], 0, 1)  # RGB stays positive
-            comm_clamped = torch.clamp(state[:, 3:6, :, :], -1, 1)  # Communication can be negative
-            state = torch.cat([rgb_clamped, comm_clamped], dim=1)
-        
-        return state
+            # Update with adaptive step size based on predicted error
+            error_adaptive_step = 0.05 + 0.15 * predicted_error  # Higher step where error predicted
+            ds = ds * error_adaptive_step
+            
+            state = state + ds
+            
+            # Advanced clamping with channel-specific ranges
+            channels = []
+            
+            # RGB channels [0,1]
+            rgb_clamped = torch.clamp(state[:, :self.rgb_channels, :, :], 0, 1)
+            channels.append(rgb_clamped)
+            
+            # Error prediction channel [0,1]
+            error_clamped = torch.clamp(state[:, self.rgb_channels:self.rgb_channels+self.error_channel, :, :], 0, 1)
+            channels.append(error_clamped)
+            
+            # Attention channel [0,1]
+            attention_clamped = torch.clamp(state[:, self.rgb_channels+self.error_channel:self.rgb_channels+self.error_channel+self.attention_channel, :, :], 0, 1)
+            channels.append(attention_clamped)
+            
+            # Communication channels [-1,1]
+            comm_clamped = torch.clamp(state[:, self.rgb_channels+self.error_channel+self.attention_channel:, :, :], -1, 1)
+            channels.append(comm_clamped)
+            
+            state = torch.cat(channels, dim=1)
+            
+        return state, predicted_errors, attention_maps
     
     def get_rgb(self, state):
-        """Extract RGB channels with full color range"""
-        # Don't use sigmoid - just clamp to [0,1] to preserve full color diversity
-        return torch.clamp(state[:, :3, :, :], 0, 1)
+        """Extract RGB channels"""
+        return torch.clamp(state[:, :self.rgb_channels, :, :], 0, 1)
+    
+    def get_error_prediction(self, state):
+        """Extract error prediction channel"""
+        return state[:, self.rgb_channels:self.rgb_channels+self.error_channel, :, :]
+    
+    def get_attention(self, state):
+        """Extract attention channel"""
+        return state[:, self.rgb_channels+self.error_channel:self.rgb_channels+self.error_channel+self.attention_channel, :, :]
+
+def rgb_to_lab(rgb_tensor):
+    """Convert RGB to LAB color space for perceptual color loss"""
+    # Simple approximation of RGB to LAB conversion
+    r, g, b = rgb_tensor[:, 0:1, :, :], rgb_tensor[:, 1:2, :, :], rgb_tensor[:, 2:3, :, :]
+    
+    # Approximate LAB conversion (simplified)
+    l = 0.299 * r + 0.587 * g + 0.114 * b  # Luminance
+    a = 0.5 * (r - g) + 0.5  # Red-Green
+    b_lab = 0.5 * (0.5 * (r + g) - b) + 0.5  # Blue-Yellow
+    
+    return torch.cat([l, a, b_lab], dim=1)
+
+def perceptual_color_loss(pred_rgb, target_rgb):
+    """Perceptual color loss in LAB space"""
+    pred_lab = rgb_to_lab(pred_rgb)
+    target_lab = rgb_to_lab(target_rgb)
+    
+    # Weight luminance more heavily
+    l_loss = F.mse_loss(pred_lab[:, 0:1, :, :], target_lab[:, 0:1, :, :]) * 2.0
+    a_loss = F.mse_loss(pred_lab[:, 1:2, :, :], target_lab[:, 1:2, :, :])
+    b_loss = F.mse_loss(pred_lab[:, 2:3, :, :], target_lab[:, 2:3, :, :])
+    
+    return l_loss + a_loss + b_loss
 
 def create_sparse_mask(frame: torch.Tensor, keep_fraction: float = 0.01) -> torch.Tensor:
     """Creates a binary mask to randomly sample pixels from frame"""
@@ -107,6 +238,44 @@ def create_sparse_mask(frame: torch.Tensor, keep_fraction: float = 0.01) -> torc
     mask_flat[indices] = 1.0
     
     return mask_flat.view(h, w).unsqueeze(0).unsqueeze(0).repeat(b, c, 1, 1)
+
+def apply_low_light(frame: torch.Tensor, light_level: float = 1.0) -> torch.Tensor:
+    """Apply low light simulation with non-linear response"""
+    # Simulate sensor response curve in low light
+    darkened = frame * light_level
+    
+    # Non-linear response - shadows get crushed more than highlights
+    darkened = torch.pow(darkened, 1.0 + (1.0 - light_level) * 0.8)
+    
+    # Reduce contrast in low light more aggressively
+    contrast_reduction = 0.2 + 0.8 * light_level
+    darkened = darkened * contrast_reduction + (1 - contrast_reduction) * 0.4
+    
+    return torch.clamp(darkened, 0, 1)
+
+def add_noise(frame: torch.Tensor, noise_level: float = 0.0, light_level: float = 1.0) -> torch.Tensor:
+    """Add noise that increases in low light conditions"""
+    if noise_level > 0:
+        # Noise increases in low light (realistic sensor behavior)
+        effective_noise = noise_level * (1.0 + 2.0 * (1.0 - light_level))
+        
+        # Add both Gaussian and salt-and-pepper noise
+        gaussian_noise = torch.randn_like(frame) * effective_noise
+        
+        # Salt and pepper noise (more pronounced in low light)
+        if light_level < 0.5:
+            salt_pepper = torch.rand_like(frame)
+            salt_mask = salt_pepper < 0.01 * effective_noise
+            pepper_mask = salt_pepper > (1.0 - 0.01 * effective_noise)
+            
+            noisy_frame = frame + gaussian_noise
+            noisy_frame = torch.where(salt_mask, torch.ones_like(frame), noisy_frame)
+            noisy_frame = torch.where(pepper_mask, torch.zeros_like(frame), noisy_frame)
+        else:
+            noisy_frame = frame + gaussian_noise
+            
+        return torch.clamp(noisy_frame, 0, 1)
+    return frame
 
 class AsyncFrameCapture:
     """Async camera capture to decouple from model updates"""
@@ -144,73 +313,120 @@ class AsyncFrameCapture:
         self.running = False
         self.cap.release()
 
-def create_initial_state(height, width, device):
-    """Create simple initial state with diverse RGB initialization"""
-    state = torch.zeros(1, 6, height, width, device=device)
+def create_initial_state(height, width, device, n_channels):
+    """Create initial state with enhanced channel initialization"""
+    state = torch.zeros(1, n_channels, height, width, device=device)
     
-    # Initialize RGB channels with random colors to encourage diversity
-    # Each pixel gets its own random RGB value
-    state[:, 0, :, :] = torch.rand(1, height, width, device=device) * 0.6 + 0.2  # Red: [0.2, 0.8]
-    state[:, 1, :, :] = torch.rand(1, height, width, device=device) * 0.6 + 0.2  # Green: [0.2, 0.8]
-    state[:, 2, :, :] = torch.rand(1, height, width, device=device) * 0.6 + 0.2  # Blue: [0.2, 0.8]
+    # Initialize RGB channels with diverse colors
+    state[:, 0, :, :] = torch.rand(1, height, width, device=device) * 0.6 + 0.2  # Red
+    state[:, 1, :, :] = torch.rand(1, height, width, device=device) * 0.6 + 0.2  # Green  
+    state[:, 2, :, :] = torch.rand(1, height, width, device=device) * 0.6 + 0.2  # Blue
+    
+    # Initialize error prediction to moderate values
+    state[:, 3, :, :] = 0.5
+    
+    # Initialize attention to uniform distribution
+    state[:, 4, :, :] = 0.5
     
     # Communication channels start at zero
-    state[:, 3:6, :, :] = 0.0
+    state[:, 5:, :, :] = 0.0
     
     return state
 
+def create_control_panel(controls):
+    """Create a visual control panel showing current settings"""
+    panel = np.zeros((250, 600, 3), dtype=np.uint8)
+    
+    # Title
+    cv2.putText(panel, 'ADAPTIVE SCOTOPIC NCA', (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+    
+    # Control values
+    y_pos = 70
+    cv2.putText(panel, f"Sparsity: {controls['sparsity']:.2f}%", (10, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 1)
+    y_pos += 35
+    cv2.putText(panel, f"Light Level: {controls['light']:.2f}", (10, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 1)
+    y_pos += 35
+    cv2.putText(panel, f"Noise Level: {controls['noise']:.3f}", (10, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 100, 100), 1)
+    y_pos += 35
+    cv2.putText(panel, f"Learning Rate: {controls['lr']:.4f}", (10, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (100, 255, 255), 1)
+    
+    # Features
+    y_pos += 50
+    cv2.putText(panel, 'NO CHEATING: Model only sees sparse input!', (10, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
+    y_pos += 25
+    cv2.putText(panel, 'Features: Uncertainty + Attention + Multi-scale', (10, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1)
+    
+    # Instructions
+    y_pos += 30
+    cv2.putText(panel, 'Use trackbars to adjust - Press Q to quit', (10, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (150, 150, 150), 1)
+    
+    return panel
+
 def run_live_online_learning(
-    resolution: int = None,
-    learning_rate: float = 1e-4,  # Much lower learning rate
-    model_fps: int = 120,
-    camera_fps: int = 120,
-    initial_sparsity: float = 0.1  # Start with 0.1% sparsity
+    resolution: int = 320,  # Good balance of detail and performance
+    base_learning_rate: float = 1e-4,  # Conservative learning rate for stability
+    model_fps: int = 60,
+    initial_sparsity: float = 1.5,
+    initial_light: float = 0.5,
+    initial_noise: float = 0.02
 ):
     """
-    Simple stable NCA for RGB reconstruction with adjustable sparsity
+    Adaptive Scotopic NCA with error prediction and attention mechanisms
     """
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    print(f"Running Simple Stable NCA on device: {device}")
+    print(f"Running Adaptive Scotopic NCA on device: {device}")
+    print(f"Resolution: {resolution}x{resolution}")
+    print("Features: Error Prediction, Attention, Multi-scale, Perceptual Loss")
 
-    # Initialize webcam and resolution
+    # Initialize webcam
     temp_cap = cv2.VideoCapture(0)
     if not temp_cap.isOpened():
         print("Error: Could not open webcam.")
         return
-        
-    if resolution is None:
-        width = int(temp_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        height = int(temp_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        native_res = min(width, height)
-        resolution = native_res
-        print(f"Using full resolution: {resolution}x{resolution}")
     temp_cap.release()
 
-    # Sparsity control using mutable container to avoid global issues
-    sparsity_control = {'value': initial_sparsity}
+    # Control parameters
+    controls = {
+        'sparsity': initial_sparsity,
+        'light': initial_light,  
+        'noise': initial_noise,
+        'lr': base_learning_rate
+    }
     
+    # Trackbar callbacks
     def on_sparsity_change(val):
-        """Trackbar callback for sparsity adjustment"""
-        # Convert trackbar value (0-1000) to percentage (0.01% - 10%)
-        sparsity_control['value'] = 0.01 + (val / 1000.0) * 9.99  # 0.01% to 10%
+        controls['sparsity'] = 0.01 + (val / 1000.0) * 19.99  # 0.01% to 20%
     
-    # Create control window with trackbar
-    cv2.namedWindow('Controls', cv2.WINDOW_NORMAL)
-    cv2.resizeWindow('Controls', 400, 100)
+    def on_light_change(val):
+        controls['light'] = val / 100.0  # 0.0 to 1.0
     
-    # Create sparsity trackbar (0-1000 maps to 0.01%-10%)
-    initial_trackbar_val = int((initial_sparsity - 0.01) * 1000 / 9.99)
-    cv2.createTrackbar('Sparsity %', 'Controls', initial_trackbar_val, 1000, on_sparsity_change)
+    def on_noise_change(val):
+        controls['noise'] = val / 1000.0  # 0.0 to 0.1
     
-    # Create a black control panel image
-    control_img = np.zeros((100, 400, 3), dtype=np.uint8)
-    cv2.putText(control_img, f'Adjust sparsity: {initial_sparsity:.2f}%', (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
-    cv2.putText(control_img, 'Range: 0.01% - 10%', (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
-    cv2.imshow('Controls', control_img)
+    def on_lr_change(val):
+        controls['lr'] = (val / 1000.0) * 0.01  # 0.0 to 0.01
+    
+    # Create control window
+    cv2.namedWindow('Adaptive Scotopic NCA Controls', cv2.WINDOW_NORMAL)
+    cv2.resizeWindow('Adaptive Scotopic NCA Controls', 600, 250)
+    
+    # Create trackbars
+    sparsity_val = int((initial_sparsity - 0.01) * 1000 / 19.99)
+    light_val = int(initial_light * 100)
+    noise_val = int(initial_noise * 1000)
+    lr_val = int(base_learning_rate * 1000 / 0.01)
+    
+    cv2.createTrackbar('Sparsity %', 'Adaptive Scotopic NCA Controls', sparsity_val, 1000, on_sparsity_change)
+    cv2.createTrackbar('Light Level', 'Adaptive Scotopic NCA Controls', light_val, 100, on_light_change)
+    cv2.createTrackbar('Noise Level', 'Adaptive Scotopic NCA Controls', noise_val, 100, on_noise_change)
+    cv2.createTrackbar('Learning Rate', 'Adaptive Scotopic NCA Controls', lr_val, 1000, on_lr_change)
 
-    # Initialize simple NCA
-    model = SimpleStableNCA().to(device)
-    optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+    # Initialize enhanced NCA
+    model = AdaptiveScotopicNCA().to(device)
+    optimizer = optim.AdamW(model.parameters(), lr=base_learning_rate, weight_decay=1e-5)
+    
+    # Learning rate scheduler
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=100, factor=0.8, verbose=True)
     
     # Initialize frame capture
     frame_capture = AsyncFrameCapture(resolution)
@@ -222,16 +438,20 @@ def run_live_online_learning(
         time.sleep(0.1)
     
     # Initialize state
-    state = create_initial_state(resolution, resolution, device)
+    state = create_initial_state(resolution, resolution, device, model.n_channels)
     
-    print(f"Starting Simple Stable NCA at max {model_fps} FPS. Press 'q' to quit.")
-    print(f"Starting with {initial_sparsity:.2f}% sparsity - use Controls window to adjust!")
-    print("Much more stable - no collapse issues!")
+    # Create main display window
+    cv2.namedWindow('Adaptive Scotopic NCA - Enhanced Vision', cv2.WINDOW_NORMAL)
+    
+    print(f"Starting Adaptive Scotopic NCA at {model_fps} FPS")
+    print("Enhanced with: Error Prediction, Attention, Multi-scale, Adaptive Learning")
+    print("Press 'q' to quit")
     
     try:
         start_time = time.time()
         last_display_time = start_time
         model_step = 0
+        loss_history = []
         
         while True:
             loop_start = time.time()
@@ -245,138 +465,186 @@ def run_live_online_learning(
             frame_tensor = torch.from_numpy(current_frame_np).float().to(device) / 255.0
             frame_tensor = frame_tensor.permute(2, 0, 1).unsqueeze(0)
 
-            # Create sparse input with adjustable sparsity
-            sparse_mask = create_sparse_mask(frame_tensor, keep_fraction=sparsity_control['value'] / 100.0)
-            sparse_input = frame_tensor
+            # Apply ALL degradations to create the actual input the model sees
+            degraded_frame = frame_tensor.clone()
+            degraded_frame = apply_low_light(degraded_frame, controls['light'])
+            degraded_frame = add_noise(degraded_frame, controls['noise'], controls['light'])
+            
+            # Create sparse mask - this is the ONLY input the model gets
+            sparse_mask = create_sparse_mask(degraded_frame, keep_fraction=controls['sparsity'] / 100.0)
+            sparse_input = degraded_frame * sparse_mask  # Only sparse pixels available!
 
-            # Run simple NCA
+            # Adaptive learning rate based on conditions
+            difficulty = (1.0 - controls['light']) + controls['noise'] + (1.0 - controls['sparsity']/100.0)
+            adaptive_lr = controls['lr'] * (1.0 + difficulty)
+            for param_group in optimizer.param_groups:
+                param_group['lr'] = adaptive_lr
+
+            # Run enhanced NCA - model only sees sparse degraded input!
             optimizer.zero_grad()
             
-            # Very few steps for stability
-            steps = 1  # Just 1 step per iteration for stability
-            evolved_state = model(state, sparse_input, sparse_mask, steps=steps)
-            
-            # Get RGB predictions
+            evolved_state, predicted_errors, attention_maps = model(
+                state, sparse_input, sparse_mask, target_frame=None, steps=1
+            )
             rgb_prediction = model.get_rgb(evolved_state)
             
-            # Main reconstruction loss
+            # Multi-component loss
+            # 1. Basic reconstruction loss
             reconstruction_loss = F.mse_loss(rgb_prediction, frame_tensor)
             
-            # Color diversity loss - encourage RGB channels to be different from each other
-            r_channel = rgb_prediction[:, 0, :, :]
-            g_channel = rgb_prediction[:, 1, :, :]
-            b_channel = rgb_prediction[:, 2, :, :]
+            # 2. Perceptual color loss
+            perceptual_loss = perceptual_color_loss(rgb_prediction, frame_tensor)
             
-            # Penalty for channels being too similar (encourages color diversity)
-            rg_similarity = F.mse_loss(r_channel, g_channel)
-            rb_similarity = F.mse_loss(r_channel, b_channel)
-            gb_similarity = F.mse_loss(g_channel, b_channel)
+            # 3. Error prediction loss (model predicts its own uncertainty)
+            if len(predicted_errors) > 0:
+                # Use prediction confidence - high error prediction where sparse input is missing
+                prediction_variance = torch.var(rgb_prediction, dim=1, keepdim=True)
+                error_prediction_loss = F.mse_loss(predicted_errors[-1], prediction_variance.detach())
+            else:
+                error_prediction_loss = 0.0
             
-            # We want to minimize similarity (maximize diversity), so subtract it
-            color_diversity_loss = -0.1 * (rg_similarity + rb_similarity + gb_similarity)
+            # 4. Attention regularization (encourage focused attention)
+            if len(attention_maps) > 0:
+                attention_entropy = -torch.mean(attention_maps[-1] * torch.log(attention_maps[-1] + 1e-8))
+                attention_loss = -0.1 * attention_entropy  # Encourage focused attention
+            else:
+                attention_loss = 0.0
             
-            # Combined loss
-            loss = reconstruction_loss + color_diversity_loss
+            # 5. Sparse input consistency loss (known pixels should be preserved)
+            sparse_consistency_loss = F.mse_loss(rgb_prediction * sparse_mask, sparse_input) * 3.0
             
-            # Very safe training
-            if not torch.isnan(loss) and not torch.isinf(loss) and loss.item() > 0:
-                loss.backward()
-                # Very aggressive gradient clipping
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.1)
+            # Combined loss with adaptive weighting
+            total_loss = (reconstruction_loss + 
+                         0.5 * perceptual_loss + 
+                         0.3 * error_prediction_loss + 
+                         0.1 * attention_loss + 
+                         0.2 * sparse_consistency_loss)
+            
+            # Training step
+            if not torch.isnan(total_loss) and not torch.isinf(total_loss) and total_loss.item() > 0:
+                total_loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
+                
+                # Update learning rate scheduler
+                loss_history.append(total_loss.item())
+                if len(loss_history) > 50:
+                    scheduler.step(np.mean(loss_history[-50:]))
             
-            # Update state for next iteration (properly detach to avoid gradient accumulation)
+            # Update state
             with torch.no_grad():
                 state = evolved_state.clone().detach()
             
-            # Reset periodically to prevent drift
-            if model_step % 1000 == 0:
+            # Reset periodically but less frequently for better adaptation
+            if model_step % 2000 == 0:
                 with torch.no_grad():
-                    state = create_initial_state(resolution, resolution, device)
+                    state = create_initial_state(resolution, resolution, device, model.n_channels)
+                print(f"Reset state at step {model_step}")
             
             model_step += 1
 
-            # Visualization
+            # Enhanced visualization
             current_time = time.time()
-            if current_time - last_display_time >= 1.0/60:
+            if current_time - last_display_time >= 1.0/30:  # 30fps display
                 last_display_time = current_time
                 
                 with torch.no_grad():
-                    # Create sparse input for visualization
-                    sparse_vis_input = frame_tensor * sparse_mask
-                    
-                    # Create visualizations with NaN safety
+                    # Create all visualizations
                     original_vis = (frame_tensor.squeeze().permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
-                    sparse_vis = (sparse_vis_input.squeeze().permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+                    degraded_vis = (degraded_frame.squeeze().permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
                     
+                    # Sparse input visualization - this is ALL the model sees!
+                    sparse_vis = (sparse_input.squeeze().permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+                    
+                    # NCA prediction
                     pred_numpy = rgb_prediction.squeeze().permute(1, 2, 0).cpu().numpy()
                     pred_numpy = np.nan_to_num(pred_numpy, nan=0.5, posinf=1.0, neginf=0.0)
                     pred_numpy = np.clip(pred_numpy, 0.0, 1.0)
                     prediction_vis = (pred_numpy * 255).astype(np.uint8)
                     
-                    # Communication channels visualization
-                    comm_channels = evolved_state[0, 3:6, :, :].mean(dim=0).cpu().numpy()
-                    comm_channels = np.nan_to_num(comm_channels, nan=0.0, posinf=1.0, neginf=0.0)
-                    comm_channels = (comm_channels - comm_channels.min()) / (comm_channels.max() - comm_channels.min() + 1e-8)
-                    comm_vis = (comm_channels * 255).astype(np.uint8)
-                    comm_vis = cv2.cvtColor(comm_vis, cv2.COLOR_GRAY2RGB)
+                    # Error prediction visualization
+                    if len(predicted_errors) > 0:
+                        error_pred = predicted_errors[-1].squeeze().cpu().numpy()
+                        error_pred = np.clip(error_pred, 0, 1)
+                        error_vis = (error_pred * 255).astype(np.uint8)
+                        error_vis = cv2.applyColorMap(error_vis, cv2.COLORMAP_HOT)
+                        error_vis = cv2.cvtColor(error_vis, cv2.COLOR_BGR2RGB)
+                    else:
+                        error_vis = np.zeros_like(original_vis)
                     
-                    # Ensure contiguous arrays for OpenCV
-                    original_vis = np.ascontiguousarray(original_vis)
-                    sparse_vis = np.ascontiguousarray(sparse_vis)
-                    prediction_vis = np.ascontiguousarray(prediction_vis)
-                    comm_vis = np.ascontiguousarray(comm_vis)
+                    # Attention visualization
+                    if len(attention_maps) > 0:
+                        attention = attention_maps[-1].squeeze().cpu().numpy()
+                        attention = np.clip(attention, 0, 1)
+                        attention_vis = (attention * 255).astype(np.uint8)
+                        attention_vis = cv2.applyColorMap(attention_vis, cv2.COLORMAP_VIRIDIS)
+                        attention_vis = cv2.cvtColor(attention_vis, cv2.COLOR_BGR2RGB)
+                    else:
+                        attention_vis = np.zeros_like(original_vis)
                     
-                    # Add text overlays
+                    # Ensure contiguous arrays
+                    frames = [original_vis, degraded_vis, sparse_vis, prediction_vis, error_vis, attention_vis]
+                    frames = [np.ascontiguousarray(frame) for frame in frames]
+                    
+                    # Add labels
                     model_fps_actual = model_step / (current_time - start_time)
-                    cv2.putText(original_vis, 'Original', (5, 15), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
-                    cv2.putText(sparse_vis, f'Sparse {sparsity_control["value"]:.2f}%', (5, 15), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
-                    cv2.putText(prediction_vis, f'Simple NCA', (5, 15), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 0), 1)
-                    cv2.putText(comm_vis, f'Communication', (5, 15), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
-                    cv2.putText(prediction_vis, f'{model_fps_actual:.0f} FPS', (5, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 0), 1)
-                    cv2.putText(sparse_vis, f'Use Controls window', (5, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.3, (255, 255, 0), 1)
-
-                    # Combine and display (4 panels)
-                    top_row = np.hstack([original_vis, sparse_vis])
-                    bottom_row = np.hstack([prediction_vis, comm_vis])
+                    labels = [
+                        'Original (Unknown to Model)',
+                        f'Degraded Full Frame',
+                        f'Model Input ({controls["sparsity"]:.1f}%)',
+                        f'NCA Reconstruction',
+                        'Uncertainty Prediction',
+                        'Attention Map'
+                    ]
+                    
+                    font_scale = 0.5
+                    font_thickness = 1
+                    for i, (frame, label) in enumerate(zip(frames, labels)):
+                        cv2.putText(frame, label, (5, 20), cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255), font_thickness)
+                        if i == 3:  # Prediction frame gets additional info
+                            cv2.putText(frame, f'{model_fps_actual:.0f} FPS', (5, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 0), 1)
+                            cv2.putText(frame, f'LR: {adaptive_lr:.4f}', (5, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.3, (0, 255, 255), 1)
+                    
+                    # Create large display - 3x2 grid
+                    display_size = 280
+                    large_frames = []
+                    for frame in frames:
+                        large_frame = cv2.resize(frame, (display_size, display_size), interpolation=cv2.INTER_NEAREST)
+                        large_frames.append(large_frame)
+                    
+                    # Arrange in 3x2 grid
+                    top_row = np.hstack([large_frames[0], large_frames[1], large_frames[2]])
+                    bottom_row = np.hstack([large_frames[3], large_frames[4], large_frames[5]])
                     combined_display = np.vstack([top_row, bottom_row])
                     
-                    h, w, _ = combined_display.shape
-                    display_width = 1200
-                    display_height = int(h * (display_width / w))
-                    large_display = cv2.resize(combined_display, (display_width, display_height))
+                    # Show displays
+                    cv2.imshow('Adaptive Scotopic NCA - Enhanced Vision', cv2.cvtColor(combined_display, cv2.COLOR_RGB2BGR))
                     
-                    cv2.imshow('Simple Stable NCA', cv2.cvtColor(large_display, cv2.COLOR_RGB2BGR))
+                    # Update control panel
+                    control_panel = create_control_panel(controls)
+                    cv2.imshow('Adaptive Scotopic NCA Controls', control_panel)
 
                 # Progress logging
-                if model_step % 120 == 0:
+                if model_step % 60 == 0:
                     model_fps_actual = model_step / (current_time - start_time)
                     
-                    # Safe stats
-                    def safe_stat(tensor, default=0.0):
-                        val = tensor.item() if hasattr(tensor, 'item') else tensor
-                        return default if (np.isnan(val) or np.isinf(val)) else val
+                    recon_val = reconstruction_loss.item() if not torch.isnan(reconstruction_loss) else 0.0
+                    perc_val = perceptual_loss.item() if not torch.isnan(perceptual_loss) else 0.0
+                    total_val = total_loss.item() if not torch.isnan(total_loss) else 0.0
                     
-                    rgb_mean = safe_stat(rgb_prediction.mean())
-                    rgb_std = safe_stat(rgb_prediction.std())
-                    loss_val = safe_stat(loss)
-                    recon_loss_val = safe_stat(reconstruction_loss)
+                    # Calculate how much information is actually available
+                    total_pixels = sparse_input.numel() / 3  # Total pixels (divide by 3 for RGB)
+                    known_pixels = (sparse_mask.sum().item() / 3)  # Pixels with known values
+                    info_ratio = known_pixels / total_pixels
                     
-                    # Color channel statistics
-                    r_mean = safe_stat(rgb_prediction[:, 0, :, :].mean())
-                    g_mean = safe_stat(rgb_prediction[:, 1, :, :].mean())
-                    b_mean = safe_stat(rgb_prediction[:, 2, :, :].mean())
-                    
-                    r_std = safe_stat(rgb_prediction[:, 0, :, :].std())
-                    g_std = safe_stat(rgb_prediction[:, 1, :, :].std())
-                    b_std = safe_stat(rgb_prediction[:, 2, :, :].std())
-                    
-                    print(f"Step {model_step}: Sparsity={sparsity_control['value']:.2f}%, ReconLoss={recon_loss_val:.6f}, TotalLoss={loss_val:.6f}, FPS={model_fps_actual:.1f}")
-                    print(f"  RGB means: R={r_mean:.3f}, G={g_mean:.3f}, B={b_mean:.3f}")
-                    print(f"  RGB stds:  R={r_std:.3f}, G={g_std:.3f}, B={b_std:.3f} - COLOR DIVERSITY!")
+                    print(f"Step {model_step}: Info={info_ratio*100:.2f}% ({known_pixels:.0f}/{total_pixels:.0f} pixels)")
+                    print(f"  Conditions: Light={controls['light']:.2f}, Noise={controls['noise']:.3f}")
+                    print(f"  Losses: Recon={recon_val:.6f}, Perc={perc_val:.6f}, Total={total_val:.6f}")
+                    print(f"  AdaptiveLR={adaptive_lr:.6f}, FPS={model_fps_actual:.1f}")
 
                 # Check for quit
-                if cv2.waitKey(1) & 0xFF == ord('q'):
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord('q'):
                     break
             
             # Timing control
@@ -390,7 +658,7 @@ def run_live_online_learning(
     finally:
         frame_capture.stop()
         cv2.destroyAllWindows()
-        print(f"Stopped after {model_step} model steps")
+        print(f"Adaptive Scotopic NCA stopped after {model_step} steps")
 
 if __name__ == '__main__':
     run_live_online_learning() 
