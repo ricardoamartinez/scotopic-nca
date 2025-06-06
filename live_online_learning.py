@@ -3,6 +3,9 @@ import torch.optim as optim
 import torch.nn.functional as F
 import cv2
 import numpy as np
+import time
+import threading
+from queue import Queue
 from scotopic_nca.model import RobustScotopicNCA
 
 def create_sparse_mask(frame: torch.Tensor, keep_fraction: float = 0.01) -> torch.Tensor:
@@ -17,155 +20,209 @@ def create_sparse_mask(frame: torch.Tensor, keep_fraction: float = 0.01) -> torc
     
     return mask_flat.view(h, w).unsqueeze(0).unsqueeze(0).repeat(b, c, 1, 1)
 
+class AsyncFrameCapture:
+    """Async camera capture to decouple from model updates"""
+    def __init__(self, resolution):
+        self.cap = cv2.VideoCapture(0)
+        self.resolution = resolution
+        self.current_frame = None
+        self.running = True
+        self.lock = threading.Lock()
+        
+    def capture_loop(self):
+        """Continuous frame capture in separate thread"""
+        while self.running:
+            ret, frame = self.cap.read()
+            if ret:
+                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                resized_frame = cv2.resize(frame_rgb, (self.resolution, self.resolution), interpolation=cv2.INTER_AREA)
+                with self.lock:
+                    self.current_frame = resized_frame
+            time.sleep(1/30)  # 30 FPS capture
+            
+    def get_current_frame(self):
+        """Get the most recent frame (thread-safe)"""
+        with self.lock:
+            return self.current_frame.copy() if self.current_frame is not None else None
+            
+    def start(self):
+        """Start async capture"""
+        self.thread = threading.Thread(target=self.capture_loop)
+        self.thread.daemon = True
+        self.thread.start()
+        
+    def stop(self):
+        """Stop capture and cleanup"""
+        self.running = False
+        self.cap.release()
+
 def run_live_online_learning(
-    resolution: int = None,  # Use manageable camera resolution 
-    learning_rate: float = 1e-5,  # Much smaller for numerical stability
-    updates_per_frame: int = 4  # Fewer updates to prevent explosion
+    resolution: int = None,  # Full native resolution as requested
+    learning_rate: float = 1e-5,  # Conservative for full resolution stability  
+    model_fps: int = 60,   # Slower for full resolution + many steps
+    camera_fps: int = 30   # Camera capture rate
 ):
     """
-    Runs live, online learning with the RobustScotopicNCA on a webcam feed.
+    Async Scotopic NCA with decoupled model/camera rates and local minima escape mechanisms.
     """
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    print(f"Running live online learning on device: {device}")
+    print(f"Running async online learning on device: {device}")
+    print(f"Model FPS: {model_fps}, Camera FPS: {camera_fps}")
 
-    # 1. Initialize Model with RANDOM weights and Optimizer
-    model = RobustScotopicNCA(device=device)
-    optimizer = optim.Adam(model.parameters(), lr=learning_rate)
-
-    # 2. Initialize webcam and get native resolution
-    cap = cv2.VideoCapture(0)
-    if not cap.isOpened():
+    # Initialize webcam and resolution
+    temp_cap = cv2.VideoCapture(0)
+    if not temp_cap.isOpened():
         print("Error: Could not open webcam.")
         return
-
-    # Get manageable resolution (native is too large for stability)
+        
     if resolution is None:
-        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        native_res = min(width, height)
-        resolution = min(native_res, 128)  # Cap at 128 for stability
-        print(f"Native resolution: {native_res}x{native_res}, using: {resolution}x{resolution}")
+        width = int(temp_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(temp_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        resolution = min(width, height)  # FULL native resolution as requested
+        print(f"Using FULL native resolution: {resolution}x{resolution}")
+    temp_cap.release()
+
+    # Initialize model with simpler architecture (closer to Aman's approach)
+    model = RobustScotopicNCA(hidden_channels=6, device=device)  # Fewer hidden channels  
+    optimizer = optim.Adam(model.parameters(), lr=learning_rate)
     
-    # 3. Initialize NCA state grid with small random values to prevent collapse
+    # Initialize async frame capture
+    frame_capture = AsyncFrameCapture(resolution)
+    frame_capture.start()
+    
+    # Wait for first frame
+    print("Waiting for camera...")
+    while frame_capture.get_current_frame() is None:
+        time.sleep(0.1)
+    
+    # Initialize NCA state grid with better starting conditions
     state_grid = torch.zeros(1, model.state_channels, resolution, resolution, device=device)
-    # Initialize prediction channels with small random values (prevent immediate collapse)
-    state_grid[:, :model.prediction_channels, :, :] = torch.rand(1, model.prediction_channels, resolution, resolution, device=device) * 0.1
+    # Initialize prediction channels with more diverse colors (prevent black convergence)
+    state_grid[:, 0, :, :] = torch.rand(1, resolution, resolution, device=device) * 0.3 + 0.2  # Red: 0.2-0.5
+    state_grid[:, 1, :, :] = torch.rand(1, resolution, resolution, device=device) * 0.3 + 0.2  # Green: 0.2-0.5  
+    state_grid[:, 2, :, :] = torch.rand(1, resolution, resolution, device=device) * 0.3 + 0.2  # Blue: 0.2-0.5
+    # Initialize hidden channels with small random values
+    state_grid[:, model.prediction_channels+model.input_channels:, :, :] = torch.randn(1, model.state_channels-model.prediction_channels-model.input_channels, resolution, resolution, device=device) * 0.01
     
-    print("Starting live feed. Press 'q' to quit. Reconstruction will improve over time.")
+    print(f"Starting async learning at {model_fps} FPS. Press 'q' to quit.")
     
-    frame_count = 0
+    model_step = 0
     
-    while True:
-        # --- CAPTURE AND PRE-PROCESS FRAME ---
-        ret, frame = cap.read()
-        if not ret:
-            break
-
-        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        resized_frame = cv2.resize(frame_rgb, (resolution, resolution), interpolation=cv2.INTER_AREA)
-        frame_tensor = torch.from_numpy(resized_frame).float().to(device) / 255.0
-        frame_tensor = frame_tensor.permute(2, 0, 1).unsqueeze(0) # Shape: (1, 3, H, W)
-
-        # --- ONLINE LEARNING STEP ---
-        optimizer.zero_grad()
+    try:
+        start_time = time.time()
+        last_display_time = start_time
         
-        # Create sparse input for this frame
-        mask = create_sparse_mask(frame_tensor).to(device)
-        sparse_input = frame_tensor * mask
-
-        # Inject sparse input into INPUT REGISTER channels (3,4,5) - Aman's approach
-        new_state_grid = state_grid.clone()
-        new_state_grid[:, model.prediction_channels:model.prediction_channels+model.input_channels, :, :] = sparse_input
-
-        # Run NCA update steps with much less aggressive decay
-        state_grid = model(new_state_grid, steps=updates_per_frame, decay=0.999)
-
-        # Get the RGB predictions from the model (channels 0,1,2)
-        prediction_rgb = model.get_prediction_rgb(state_grid)
-        
-        # DEBUGGING: Check if prediction is collapsing
-        pred_mean = prediction_rgb.mean().item()
-        pred_max = prediction_rgb.max().item()
-        pred_min = prediction_rgb.min().item()
-        
-        # CRITICAL: Use much gentler loss to prevent collapse
-        # Only compare on sparse pixels to start with
-        sparse_pixel_loss = F.mse_loss(prediction_rgb * mask, sparse_input)
-        
-        # Add a small "alive" loss to prevent total collapse
-        alive_loss = F.mse_loss(prediction_rgb.mean(), torch.tensor(0.1, device=device))
-        
-        # Much gentler combined loss
-        loss = sparse_pixel_loss + 0.01 * alive_loss
-        
-        # Debug collapse with emergency break
-        if frame_count > 30 and pred_max < 0.001:
-            print(f"*** SEVERE COLLAPSE DETECTED at frame {frame_count} ***")
-            print(f"  Pred range: [{pred_min:.6f}, {pred_max:.6f}]")
-            print(f"  Sparse loss: {sparse_pixel_loss.item():.6f}")
-            print(f"  State mean: {state_grid.mean().item():.6f}")
-            print(f"  Breaking to prevent further collapse...")
-            break
-        
-        # Backpropagation and weight update on EVERY frame
-        loss.backward()
-        
-        # Aggressive gradient clipping to prevent explosion
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.1)
-        
-        optimizer.step()
-        
-        # Detach state grid for next iteration to avoid gradient accumulation
-        state_grid = state_grid.detach()
-        
-        # CRITICAL: Clamp state values to prevent numerical explosion
-        state_grid = torch.clamp(state_grid, -10.0, 10.0)
-        
-        frame_count += 1
-        
-        # Print progress every 30 frames (roughly 1 second)
-        if frame_count % 30 == 0:
-            pred_std = prediction_rgb.std().item()
-            sparse_loss_val = sparse_pixel_loss.item()
-            alive_loss_val = alive_loss.item()
-            print(f"Frame {frame_count}: Total={loss.item():.6f}, Sparse={sparse_loss_val:.6f}, Alive={alive_loss_val:.6f}, Pred=[{pred_min:.3f}, {pred_mean:.3f}, {pred_max:.3f}]")
-
-        # --- VISUALIZATION ---
-        with torch.no_grad():
-            # Prepare frames for display - ensure proper format for OpenCV
-            original_vis = (frame_tensor.squeeze().permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
-            sparse_vis = (sparse_input.squeeze().permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+        while True:
+            loop_start = time.time()
             
-            # Show the PREDICTION channels (0,1,2) - Aman's approach
-            prediction_vis = (prediction_rgb.squeeze().permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+            # Get current frame from async capture
+            current_frame_np = frame_capture.get_current_frame()
+            if current_frame_np is None:
+                time.sleep(0.001)
+                continue
+                
+            # Convert to tensor - same frame might be used multiple times with different sampling
+            frame_tensor = torch.from_numpy(current_frame_np).float().to(device) / 255.0
+            frame_tensor = frame_tensor.permute(2, 0, 1).unsqueeze(0)
+
+            # --- ONLINE LEARNING STEP ---
+            optimizer.zero_grad()
             
-            # Ensure arrays are contiguous and properly shaped for OpenCV
-            original_vis = np.ascontiguousarray(original_vis)
-            sparse_vis = np.ascontiguousarray(sparse_vis)
-            prediction_vis = np.ascontiguousarray(prediction_vis)
+            # Create NEW sparse mask each step (different sampling of same frame)
+            mask = create_sparse_mask(frame_tensor).to(device)
+            sparse_input = frame_tensor * mask
 
-            # Add text labels
-            cv2.putText(original_vis, 'Original (RGB)', (5, 15), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-            cv2.putText(sparse_vis, 'Input (1%)', (5, 15), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
-            cv2.putText(prediction_vis, f'NCA Prediction (Loss: {loss.item():.4f})', (5, 15), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
+            # Inject sparse input into INPUT REGISTER channels (3,4,5)
+            new_state_grid = state_grid.clone()
+            new_state_grid[:, model.prediction_channels:model.prediction_channels+model.input_channels, :, :] = sparse_input
 
-            # Combine frames into a single large display window
-            combined_display = np.hstack([original_vis, sparse_vis, prediction_vis])
+            # No exploration noise - keep it simple like Aman's approach
+
+            # Run MANY update steps - Aman's key insight: "information travels 1 pixel at a time"
+            # Need 50-100+ steps for information to propagate across the image
+            steps = max(50, resolution // 8)  # Scale steps with resolution 
+            state_grid = model(new_state_grid, steps=steps, decay=0.999)
+
+            # Get RGB predictions
+            prediction_rgb = model.get_prediction_rgb(state_grid)
             
-            # Resize for better viewing
-            h, w, _ = combined_display.shape
-            display_width = 1280
-            display_height = int(h * (display_width / w))
-            large_display = cv2.resize(combined_display, (display_width, display_height))
+            # AMAN'S SIMPLE APPROACH: Just L2 loss between prediction and sparse input where data exists
+            # "We will compare the cell's estimate value to the incoming value to compute loss. We will use L2 loss."
+            loss = F.mse_loss(prediction_rgb * mask, sparse_input)
             
-            cv2.imshow('Scotopic Vision NCA - Aman Bhargava Method', cv2.cvtColor(large_display, cv2.COLOR_RGB2BGR))
+            # Backpropagation
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.1)
+            optimizer.step()
+            
+            # Detach and clamp state
+            state_grid = state_grid.detach()
+            state_grid = torch.clamp(state_grid, -10.0, 10.0)
+            
+            # Simple monitoring - no complex local minima detection
+            
+            model_step += 1
 
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            break
+            # --- VISUALIZATION (less frequent than model updates) ---
+            current_time = time.time()
+            if current_time - last_display_time >= 1.0/30:  # 30 FPS display
+                last_display_time = current_time
+                
+                with torch.no_grad():
+                    # Stats for monitoring
+                    pred_mean = prediction_rgb.mean().item()
+                    pred_max = prediction_rgb.max().item()
+                    pred_min = prediction_rgb.min().item()
+                    pred_std = prediction_rgb.std().item()
+                    
+                    # Prepare display frames
+                    original_vis = (frame_tensor.squeeze().permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+                    sparse_vis = (sparse_input.squeeze().permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+                    prediction_vis = (prediction_rgb.squeeze().permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+                    
+                    # Ensure contiguous arrays
+                    original_vis = np.ascontiguousarray(original_vis)
+                    sparse_vis = np.ascontiguousarray(sparse_vis)
+                    prediction_vis = np.ascontiguousarray(prediction_vis)
 
-    cap.release()
-    cv2.destroyAllWindows()
-    print("Inference stopped.")
+                    # Add enhanced status text
+                    model_fps_actual = model_step / (current_time - start_time)
+                    cv2.putText(original_vis, 'Original (RGB)', (5, 15), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                    cv2.putText(sparse_vis, 'Sparse (1%)', (5, 15), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+                    cv2.putText(prediction_vis, f'Aman NCA ({model_fps_actual:.0f}fps)', (5, 15), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
+                    cv2.putText(prediction_vis, f'Steps: {steps}', (5, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 0), 1)
+                    cv2.putText(prediction_vis, f'Range: [{pred_min:.2f}, {pred_max:.2f}]', (5, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 0), 1)
+
+                    # Combine and display
+                    combined_display = np.hstack([original_vis, sparse_vis, prediction_vis])
+                    h, w, _ = combined_display.shape
+                    display_width = 1200
+                    display_height = int(h * (display_width / w))
+                    large_display = cv2.resize(combined_display, (display_width, display_height))
+                    
+                    cv2.imshow('Aman Bhargava Scotopic NCA - Exact Implementation', cv2.cvtColor(large_display, cv2.COLOR_RGB2BGR))
+
+                # Print progress every 120 model steps (~1 second at 120fps)  
+                if model_step % 120 == 0:
+                    print(f"Step {model_step}: Loss={loss.item():.6f}, Steps={steps}, "
+                          f"ModelFPS={model_fps_actual:.1f}, Pred=[{pred_min:.3f}, {pred_max:.3f}], Std={pred_std:.3f}")
+
+                # Check for quit
+                if cv2.waitKey(1) & 0xFF == ord('q'):
+                    break
+            
+            # Timing control for target model FPS
+            loop_time = time.time() - loop_start
+            target_loop_time = 1.0 / model_fps
+            if loop_time < target_loop_time:
+                time.sleep(target_loop_time - loop_time)
+                
+    except KeyboardInterrupt:
+        print("Interrupted by user")
+    finally:
+        frame_capture.stop()
+        cv2.destroyAllWindows()
+        print(f"Stopped after {model_step} model steps")
 
 if __name__ == '__main__':
     run_live_online_learning() 
