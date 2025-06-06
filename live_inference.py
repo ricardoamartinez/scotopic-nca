@@ -66,13 +66,13 @@ def run_live_online_learning(
             # ONLINE LEARNING: Update model weights on this frame
             optimizer.zero_grad()
             
-            # Inject sparse input and run NCA
-            new_state = state_grid.clone()
+            # Inject sparse input and run NCA (detach state_grid to avoid gradient accumulation)
+            new_state = state_grid.detach().clone()
             new_state[:, model.input_channel:model.input_channel+1, :, :] = sparse_input
-            state_grid = model(new_state, steps=updates_per_frame)
+            updated_state = model(new_state, steps=updates_per_frame)
             
             # Get prediction
-            prediction = state_grid[:, model.pred_channel:model.pred_channel+1, :, :]
+            prediction = updated_state[:, model.pred_channel:model.pred_channel+1, :, :]
             
             # Compute loss - try to reconstruct the full frame from sparse input
             reconstruction_loss = F.mse_loss(prediction, frame_tensor)
@@ -82,6 +82,9 @@ def run_live_online_learning(
             # Backpropagation and weight update
             total_loss.backward()
             optimizer.step()
+            
+            # Update state_grid for next frame (detached from computation graph)
+            state_grid = updated_state.detach()
 
             # Visualization
             original_vis = (frame_tensor.squeeze().cpu().numpy() * 255).astype(np.uint8)
