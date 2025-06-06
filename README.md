@@ -1,27 +1,35 @@
-# Scotopic Neural Cellular Automata
+# Scotopic Neural Cellular Automata - Live Demo
 
-This project implements a Neural Cellular Automata (NCA) for reconstructing video frames from extremely sparse pixel data (scotopic vision), based on the demo by Aman Bhargava.
+This project implements a Neural Cellular Automata (NCA) for reconstructing a live camera feed from extremely sparse pixel data (scotopic vision), based on the demo by Aman Bhargava.
 
-## Project Structure
-
-- `scotopic_nca/model.py`: Defines the `ScotopicNCA` PyTorch model.
-- `scotopic_nca/data.py`: Utilities for generating synthetic video data and sparse masks.
-- `scotopic_nca/training.py`: The main training script for the baseline model.
-- `tests/`: Contains `pytest` tests for verification.
+The system first trains a model on synthetic data and then uses the trained model to perform real-time inference on a webcam feed.
 
 ## How to Run
 
-1.  **Install Dependencies:**
-    ```bash
-    pip install -r requirements.txt
-    ```
+### Step 1: Train the Model
 
-2.  **Run Training:**
-    ```bash
-    python -m scotopic_nca.training
-    ```
+First, you need to train the baseline NCA model. This will generate a `scotopic_nca_baseline.pth` file containing the model weights.
 
-3.  **Run Tests:**
-    ```bash
-    pytest
-    ``` 
+```bash
+# Install dependencies
+pip install -r requirements.txt
+
+# Run training
+python -m scotopic_nca.training
+```
+
+### Step 2: Run Live Inference
+
+Once the model is trained, run the live inference script. This will open your webcam and display the real-time reconstruction.
+
+```bash
+python live_inference.py
+```
+Press 'q' in the display window to quit.
+
+### Running Tests
+
+To verify the core components, you can run the test suite:
+```bash
+pytest
+``` 

@@ -1,4 +1,4 @@
 {
   "image": "ubuntu:22.04",
-  "on_create": "pip install torch torchvision numpy pywavelets pytest"
+  "on_create": "pip install torch torchvision numpy opencv-python-headless pytest"
 } 

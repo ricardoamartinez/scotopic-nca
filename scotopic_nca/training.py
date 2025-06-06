@@ -6,17 +6,20 @@ import torch.optim as optim
 import torch.nn.functional as F
 from .model import ScotopicNCA
 from .data import generate_moving_square_video, create_sparse_mask
+import os
 
 def train_baseline_nca(
-    epochs: int = 100,
+    epochs: int = 200,
     sequence_length: int = 32,
     frame_size: int = 64,
     learning_rate: float = 1e-3,
     updates_per_frame: int = 1,
-    device: str = 'cpu'
+    device: str = 'cpu',
+    save_path: str = 'scotopic_nca_baseline.pth'
 ):
     """
     Main training loop for the baseline Scotopic NCA.
+    Saves the trained model's state_dict to the specified path.
     """
     print(f"Starting training on device: {device}")
 
@@ -72,6 +75,11 @@ def train_baseline_nca(
 
         if (epoch + 1) % 10 == 0:
             print(f"Epoch [{epoch+1}/{epochs}], Loss: {total_loss.item():.6f}")
+
+    # 4. Save the trained model
+    if save_path:
+        torch.save(model.state_dict(), save_path)
+        print(f"Model saved to {save_path}")
 
     print("Training complete.")
     return model
