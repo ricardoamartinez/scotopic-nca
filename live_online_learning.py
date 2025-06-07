@@ -163,10 +163,11 @@ def run_live_online_learning(
     resolution: int = None,
     learning_rate: float = 1e-4,  # Much lower learning rate
     model_fps: int = 120,
-    camera_fps: int = 120
+    camera_fps: int = 120,
+    initial_sparsity: float = 0.1  # Start with 0.1% sparsity
 ):
     """
-    Simple stable NCA for RGB reconstruction - no collapse issues
+    Simple stable NCA for RGB reconstruction with adjustable sparsity
     """
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     print(f"Running Simple Stable NCA on device: {device}")
@@ -185,6 +186,28 @@ def run_live_online_learning(
         print(f"Using full resolution: {resolution}x{resolution}")
     temp_cap.release()
 
+    # Sparsity control using mutable container to avoid global issues
+    sparsity_control = {'value': initial_sparsity}
+    
+    def on_sparsity_change(val):
+        """Trackbar callback for sparsity adjustment"""
+        # Convert trackbar value (0-1000) to percentage (0.01% - 10%)
+        sparsity_control['value'] = 0.01 + (val / 1000.0) * 9.99  # 0.01% to 10%
+    
+    # Create control window with trackbar
+    cv2.namedWindow('Controls', cv2.WINDOW_NORMAL)
+    cv2.resizeWindow('Controls', 400, 100)
+    
+    # Create sparsity trackbar (0-1000 maps to 0.01%-10%)
+    initial_trackbar_val = int((initial_sparsity - 0.01) * 1000 / 9.99)
+    cv2.createTrackbar('Sparsity %', 'Controls', initial_trackbar_val, 1000, on_sparsity_change)
+    
+    # Create a black control panel image
+    control_img = np.zeros((100, 400, 3), dtype=np.uint8)
+    cv2.putText(control_img, f'Adjust sparsity: {initial_sparsity:.2f}%', (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+    cv2.putText(control_img, 'Range: 0.01% - 10%', (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+    cv2.imshow('Controls', control_img)
+
     # Initialize simple NCA
     model = SimpleStableNCA().to(device)
     optimizer = optim.Adam(model.parameters(), lr=learning_rate)
@@ -202,6 +225,7 @@ def run_live_online_learning(
     state = create_initial_state(resolution, resolution, device)
     
     print(f"Starting Simple Stable NCA at max {model_fps} FPS. Press 'q' to quit.")
+    print(f"Starting with {initial_sparsity:.2f}% sparsity - use Controls window to adjust!")
     print("Much more stable - no collapse issues!")
     
     try:
@@ -221,8 +245,8 @@ def run_live_online_learning(
             frame_tensor = torch.from_numpy(current_frame_np).float().to(device) / 255.0
             frame_tensor = frame_tensor.permute(2, 0, 1).unsqueeze(0)
 
-            # Create sparse input with enough information for color learning
-            sparse_mask = create_sparse_mask(frame_tensor, keep_fraction=0.05)  # 5% for better color learning
+            # Create sparse input with adjustable sparsity
+            sparse_mask = create_sparse_mask(frame_tensor, keep_fraction=sparsity_control['value'] / 100.0)
             sparse_input = frame_tensor
 
             # Run simple NCA
@@ -306,10 +330,11 @@ def run_live_online_learning(
                     # Add text overlays
                     model_fps_actual = model_step / (current_time - start_time)
                     cv2.putText(original_vis, 'Original', (5, 15), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
-                    cv2.putText(sparse_vis, f'Sparse 5%', (5, 15), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
+                    cv2.putText(sparse_vis, f'Sparse {sparsity_control["value"]:.2f}%', (5, 15), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
                     cv2.putText(prediction_vis, f'Simple NCA', (5, 15), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 0), 1)
                     cv2.putText(comm_vis, f'Communication', (5, 15), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
                     cv2.putText(prediction_vis, f'{model_fps_actual:.0f} FPS', (5, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 0), 1)
+                    cv2.putText(sparse_vis, f'Use Controls window', (5, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.3, (255, 255, 0), 1)
 
                     # Combine and display (4 panels)
                     top_row = np.hstack([original_vis, sparse_vis])
@@ -346,7 +371,7 @@ def run_live_online_learning(
                     g_std = safe_stat(rgb_prediction[:, 1, :, :].std())
                     b_std = safe_stat(rgb_prediction[:, 2, :, :].std())
                     
-                    print(f"Step {model_step}: ReconLoss={recon_loss_val:.6f}, TotalLoss={loss_val:.6f}, FPS={model_fps_actual:.1f}")
+                    print(f"Step {model_step}: Sparsity={sparsity_control['value']:.2f}%, ReconLoss={recon_loss_val:.6f}, TotalLoss={loss_val:.6f}, FPS={model_fps_actual:.1f}")
                     print(f"  RGB means: R={r_mean:.3f}, G={g_mean:.3f}, B={b_mean:.3f}")
                     print(f"  RGB stds:  R={r_std:.3f}, G={g_std:.3f}, B={b_std:.3f} - COLOR DIVERSITY!")
 
